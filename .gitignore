@@ -1,0 +1,4 @@
+.env
+backend/dashboard.db
+backend/*.db
+backend/*.db-*
