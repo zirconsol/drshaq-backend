@@ -1,4 +1,4 @@
 .env
-backend/dashboard.db
-backend/*.db
-backend/*.db-*
+dashboard.db
+*.db
+*.db-*
