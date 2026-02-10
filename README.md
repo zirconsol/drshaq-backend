@@ -6,7 +6,10 @@ API privada para el dashboard interno (no para uso publico en la landing), con:
 - CRUD de productos y catalogos con estados (`draft`, `published`, `archived`)
 - categorias de drop + tipos de producto, orden e imagenes (se guarda `path` en DB)
 - tracking de eventos CTA (`impression`, `click`) con `page`, `source`, `session_id`, timestamp
+- tracking anonimo de embudo (`cta_click`, `add_to_request`, `request_submitted`) con `session_id`/`visitor_id`
+- requests de productos sin login de usuario (estado: `submitted`, `contacted`, `fulfilled`, `declined_*`)
 - reporting de KPIs por rango de fechas (totales, por producto, por catalogo, UTM/referrer)
+- reporting de embudo CTA->request->fulfilled y productos mas pedidos
 - auditoria de cambios (`quien`, `que`, `cuando`, estado previo/posterior)
 - rate limiting basico para ingesta de eventos
 - CORS restringido por `CORS_ALLOWED_ORIGINS`
@@ -82,10 +85,18 @@ Regla de negocio en productos: si se informa `collection_id` (tipo), `category_i
 - `POST|PATCH|DELETE /api/v1/catalogs/{catalog_id}/images...`
 
 - `POST /api/v1/analytics/events`
+- `POST /api/v1/analytics/public/events` (ingesta publica para landing; opcional `X-Events-Key`)
+
+- `POST /api/v1/requests/public` (crea request anonimo de productos)
+- `GET /api/v1/requests`
+- `GET /api/v1/requests/{request_id}`
+- `PATCH /api/v1/requests/{request_id}/status`
 
 - `GET /api/v1/reporting/kpis`
 - `GET /api/v1/reporting/top-products`
 - `GET /api/v1/reporting/utm-referrer`
+- `GET /api/v1/reporting/funnel`
+- `GET /api/v1/reporting/top-requested-products`
 
 - `GET /api/v1/audit/logs` (solo `admin`)
 

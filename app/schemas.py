@@ -4,7 +4,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.models import ContentStatus, EventType, UserRole
+from app.models import ContentStatus, EventType, RequestStatus, UserRole
 
 SLUG_PATTERN = r'^[a-z0-9]+(?:-[a-z0-9]+)*$'
 
@@ -282,9 +282,11 @@ class AnalyticsEventCreate(StrictSchema):
     event_type: EventType
     product_id: str | None = Field(default=None, min_length=36, max_length=36)
     catalog_id: str | None = Field(default=None, min_length=36, max_length=36)
+    request_id: str | None = Field(default=None, min_length=36, max_length=36)
     page: str = Field(min_length=1, max_length=255)
     source: str = Field(min_length=1, max_length=255)
     session_id: str = Field(min_length=8, max_length=120)
+    visitor_id: str | None = Field(default=None, min_length=8, max_length=120)
     occurred_at: datetime | None = None
     utm_source: str | None = Field(default=None, max_length=120)
     utm_medium: str | None = Field(default=None, max_length=120)
@@ -293,8 +295,11 @@ class AnalyticsEventCreate(StrictSchema):
 
     @model_validator(mode='after')
     def validate_target(self) -> 'AnalyticsEventCreate':
-        if not self.product_id and not self.catalog_id:
-            raise ValueError('Debe incluir product_id o catalog_id para atribucion')
+        if self.event_type == EventType.request_submitted and not self.request_id:
+            raise ValueError('request_submitted requiere request_id')
+        if self.event_type in {EventType.impression, EventType.click, EventType.add_to_request}:
+            if not self.product_id and not self.catalog_id:
+                raise ValueError('Debe incluir product_id o catalog_id para atribucion')
         return self
 
 
@@ -303,10 +308,71 @@ class AnalyticsEventRead(StrictSchema):
     event_type: EventType
     product_id: str | None
     catalog_id: str | None
+    request_id: str | None
     page: str
     source: str
     session_id: str
+    visitor_id: str | None
     occurred_at: datetime
+
+
+class ProductRequestItemCreate(StrictSchema):
+    product_id: str = Field(min_length=36, max_length=36)
+    quantity: int = Field(default=1, ge=1, le=200)
+
+
+class ProductRequestCreate(StrictSchema):
+    session_id: str = Field(min_length=8, max_length=120)
+    visitor_id: str | None = Field(default=None, min_length=8, max_length=120)
+    page: str = Field(min_length=1, max_length=255)
+    source: str = Field(min_length=1, max_length=255)
+    customer_name: str | None = Field(default=None, min_length=2, max_length=160)
+    customer_email: str | None = Field(default=None, max_length=160)
+    customer_phone: str | None = Field(default=None, max_length=60)
+    notes: str | None = Field(default=None, max_length=4000)
+    utm_source: str | None = Field(default=None, max_length=120)
+    utm_medium: str | None = Field(default=None, max_length=120)
+    utm_campaign: str | None = Field(default=None, max_length=120)
+    referrer: str | None = Field(default=None, max_length=512)
+    items: list[ProductRequestItemCreate] = Field(min_length=1, max_length=50)
+
+
+class ProductRequestItemRead(StrictSchema):
+    product_id: str | None
+    product_name: str
+    quantity: int
+
+
+class ProductRequestRead(StrictSchema):
+    id: str
+    session_id: str
+    visitor_id: str | None
+    status: RequestStatus
+    page: str | None
+    source: str | None
+    customer_name: str | None
+    customer_email: str | None
+    customer_phone: str | None
+    notes: str | None
+    utm_source: str | None
+    utm_medium: str | None
+    utm_campaign: str | None
+    referrer: str | None
+    created_at: datetime
+    updated_at: datetime
+    contacted_at: datetime | None
+    resolved_at: datetime | None
+    items: list[ProductRequestItemRead] = Field(default_factory=list)
+
+
+class ProductRequestListResponse(StrictSchema):
+    items: list[ProductRequestRead]
+    meta: PaginationMeta
+
+
+class ProductRequestStatusUpdate(StrictSchema):
+    status: RequestStatus
+    notes: str | None = Field(default=None, max_length=4000)
 
 
 class KpiSummary(StrictSchema):
@@ -358,6 +424,35 @@ class UTMReferrerResponse(StrictSchema):
     start_at: datetime
     end_at: datetime
     items: list[UTMReferrerKpi]
+
+
+class FunnelKpiResponse(StrictSchema):
+    start_at: datetime
+    end_at: datetime
+    cta_users: int
+    request_submissions: int
+    request_users: int
+    fulfilled_requests: int
+    fulfilled_users: int
+    declined_requests: int
+    cta_to_request_rate: float
+    request_to_fulfilled_rate: float
+    cta_to_fulfilled_rate: float
+
+
+class TopRequestedProductKpi(StrictSchema):
+    product_id: str | None
+    product_name: str
+    request_count: int
+    requested_quantity: int
+    fulfilled_quantity: int
+    fulfillment_rate: float
+
+
+class TopRequestedProductsResponse(StrictSchema):
+    start_at: datetime
+    end_at: datetime
+    items: list[TopRequestedProductKpi]
 
 
 class AuditLogRead(StrictSchema):

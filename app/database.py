@@ -42,3 +42,11 @@ def _apply_schema_updates() -> None:
         if 'is_featured' not in existing_columns:
             with engine.begin() as conn:
                 conn.execute(text('ALTER TABLE news ADD COLUMN is_featured BOOLEAN NOT NULL DEFAULT FALSE'))
+
+    if inspector.has_table('analytics_events'):
+        existing_columns = {column['name'] for column in inspector.get_columns('analytics_events')}
+        with engine.begin() as conn:
+            if 'visitor_id' not in existing_columns:
+                conn.execute(text('ALTER TABLE analytics_events ADD COLUMN visitor_id VARCHAR(120)'))
+            if 'request_id' not in existing_columns:
+                conn.execute(text('ALTER TABLE analytics_events ADD COLUMN request_id VARCHAR(36)'))

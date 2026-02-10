@@ -6,13 +6,16 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import require_roles
-from app.models import AnalyticsEvent, Catalog, EventType, Product, UserRole
+from app.models import AnalyticsEvent, Catalog, EventType, Product, ProductRequest, ProductRequestItem, RequestStatus, UserRole
 from app.schemas import (
     CatalogKpi,
+    FunnelKpiResponse,
     KpiReportResponse,
     KpiSummary,
     ProductKpi,
     TopProductsResponse,
+    TopRequestedProductKpi,
+    TopRequestedProductsResponse,
     UTMReferrerKpi,
     UTMReferrerResponse,
 )
@@ -22,6 +25,7 @@ router = APIRouter(prefix='/reporting', tags=['reporting'])
 
 impression_case = case((AnalyticsEvent.event_type == EventType.impression, 1), else_=0)
 click_case = case((AnalyticsEvent.event_type == EventType.click, 1), else_=0)
+fulfilled_qty_case = case((ProductRequest.status == RequestStatus.fulfilled, ProductRequestItem.quantity), else_=0)
 
 
 def _resolve_dates(start_at: datetime | None, end_at: datetime | None) -> tuple[datetime, datetime]:
@@ -32,6 +36,10 @@ def _resolve_dates(start_at: datetime | None, end_at: datetime | None) -> tuple[
 
 def _ctr(clicks: int, impressions: int) -> float:
     return round((clicks / impressions) * 100, 2) if impressions > 0 else 0.0
+
+
+def _rate(part: int, total: int) -> float:
+    return round((part / total) * 100, 2) if total > 0 else 0.0
 
 
 @router.get('/kpis', response_model=KpiReportResponse, dependencies=[Depends(require_roles(UserRole.admin, UserRole.editor))])
@@ -193,3 +201,129 @@ def get_utm_referrer_performance(
     ]
 
     return UTMReferrerResponse(start_at=start, end_at=end, items=items)
+
+
+@router.get('/funnel', response_model=FunnelKpiResponse, dependencies=[Depends(require_roles(UserRole.admin, UserRole.editor))])
+def get_funnel_kpis(
+    start_at: datetime | None = Query(default=None),
+    end_at: datetime | None = Query(default=None),
+    source: str | None = Query(default=None, min_length=1, max_length=255),
+    db: Session = Depends(get_db),
+) -> FunnelKpiResponse:
+    start, end = _resolve_dates(start_at, end_at)
+    identity_expr = func.coalesce(AnalyticsEvent.visitor_id, AnalyticsEvent.session_id)
+    request_identity_expr = func.coalesce(ProductRequest.visitor_id, ProductRequest.session_id)
+
+    cta_filters = [
+        AnalyticsEvent.event_type == EventType.cta_click,
+        AnalyticsEvent.occurred_at >= start,
+        AnalyticsEvent.occurred_at <= end,
+    ]
+    request_filters = [ProductRequest.created_at >= start, ProductRequest.created_at <= end]
+    if source:
+        cta_filters.append(AnalyticsEvent.source == source)
+        request_filters.append(ProductRequest.source == source)
+
+    cta_identity_subquery = select(func.distinct(identity_expr).label('identity')).where(*cta_filters).subquery()
+    cta_users = int(db.execute(select(func.count()).select_from(cta_identity_subquery)).scalar_one() or 0)
+
+    request_filters_from_cta = [*request_filters, request_identity_expr.in_(select(cta_identity_subquery.c.identity))]
+
+    request_submissions = int(
+        db.execute(select(func.count(ProductRequest.id)).where(*request_filters_from_cta)).scalar_one() or 0
+    )
+    request_users = int(
+        db.execute(select(func.count(func.distinct(request_identity_expr))).where(*request_filters_from_cta)).scalar_one()
+        or 0
+    )
+    fulfilled_requests = int(
+        db.execute(
+            select(func.count(ProductRequest.id)).where(
+                *request_filters_from_cta,
+                ProductRequest.status == RequestStatus.fulfilled,
+            )
+        ).scalar_one()
+        or 0
+    )
+    fulfilled_users = int(
+        db.execute(
+            select(func.count(func.distinct(request_identity_expr))).where(
+                *request_filters_from_cta,
+                ProductRequest.status == RequestStatus.fulfilled,
+            )
+        ).scalar_one()
+        or 0
+    )
+    declined_requests = int(
+        db.execute(
+            select(func.count(ProductRequest.id)).where(
+                *request_filters_from_cta,
+                ProductRequest.status.in_([RequestStatus.declined_customer, RequestStatus.declined_business]),
+            )
+        ).scalar_one()
+        or 0
+    )
+
+    return FunnelKpiResponse(
+        start_at=start,
+        end_at=end,
+        cta_users=cta_users,
+        request_submissions=request_submissions,
+        request_users=request_users,
+        fulfilled_requests=fulfilled_requests,
+        fulfilled_users=fulfilled_users,
+        declined_requests=declined_requests,
+        cta_to_request_rate=_rate(request_users, cta_users),
+        request_to_fulfilled_rate=_rate(fulfilled_users, request_users),
+        cta_to_fulfilled_rate=_rate(fulfilled_users, cta_users),
+    )
+
+
+@router.get(
+    '/top-requested-products',
+    response_model=TopRequestedProductsResponse,
+    dependencies=[Depends(require_roles(UserRole.admin, UserRole.editor))],
+)
+def get_top_requested_products(
+    start_at: datetime | None = Query(default=None),
+    end_at: datetime | None = Query(default=None),
+    limit: int = Query(default=10, ge=1, le=100),
+    source: str | None = Query(default=None, min_length=1, max_length=255),
+    db: Session = Depends(get_db),
+) -> TopRequestedProductsResponse:
+    start, end = _resolve_dates(start_at, end_at)
+    name_expr = func.coalesce(Product.name, ProductRequestItem.product_name).label('product_name')
+
+    filters = [ProductRequest.created_at >= start, ProductRequest.created_at <= end]
+    if source:
+        filters.append(ProductRequest.source == source)
+
+    rows = db.execute(
+        select(
+            ProductRequestItem.product_id,
+            name_expr,
+            func.count(func.distinct(ProductRequestItem.request_id)).label('request_count'),
+            func.coalesce(func.sum(ProductRequestItem.quantity), 0).label('requested_quantity'),
+            func.coalesce(func.sum(fulfilled_qty_case), 0).label('fulfilled_quantity'),
+        )
+        .join(ProductRequest, ProductRequest.id == ProductRequestItem.request_id)
+        .outerjoin(Product, Product.id == ProductRequestItem.product_id)
+        .where(*filters)
+        .group_by(ProductRequestItem.product_id, name_expr)
+        .order_by(func.sum(ProductRequestItem.quantity).desc(), func.count(func.distinct(ProductRequestItem.request_id)).desc())
+        .limit(limit)
+    ).all()
+
+    items = [
+        TopRequestedProductKpi(
+            product_id=row.product_id,
+            product_name=row.product_name,
+            request_count=int(row.request_count or 0),
+            requested_quantity=int(row.requested_quantity or 0),
+            fulfilled_quantity=int(row.fulfilled_quantity or 0),
+            fulfillment_rate=_rate(int(row.fulfilled_quantity or 0), int(row.requested_quantity or 0)),
+        )
+        for row in rows
+    ]
+
+    return TopRequestedProductsResponse(start_at=start, end_at=end, items=items)

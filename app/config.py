@@ -26,6 +26,10 @@ class Settings(BaseSettings):
 
     event_rate_limit_window_seconds: int = Field(default=60, ge=1, le=3600)
     event_rate_limit_requests: int = Field(default=120, ge=1, le=5000)
+    public_event_rate_limit_window_seconds: int = Field(default=60, ge=1, le=3600)
+    public_event_rate_limit_requests: int = Field(default=300, ge=1, le=10000)
+    public_event_write_key: str | None = None
+    public_tracking_allowed_origins: Annotated[List[str], NoDecode] = Field(default_factory=list)
 
     admin_seed_username: str = 'admin'
     admin_seed_password: str = Field(default='admin12345', min_length=8)
@@ -56,6 +60,11 @@ class Settings(BaseSettings):
                     return [str(item).strip() for item in parsed if str(item).strip()]
             return [item.strip() for item in value.split(',') if item.strip()]
         return value
+
+    @field_validator('public_tracking_allowed_origins', mode='before')
+    @classmethod
+    def split_public_tracking_origins(cls, value: str | List[str]) -> List[str]:
+        return cls.split_cors_origins(value)
 
 
 @lru_cache(maxsize=1)

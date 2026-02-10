@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.auth import ensure_seed_users
 from app.config import get_settings
 from app.database import SessionLocal, init_db
-from app.routers import admin_news, admin_products, analytics, assets, audit, auth, catalogs, news, products, reporting, taxonomy
+from app.routers import admin_news, admin_products, analytics, assets, audit, auth, catalogs, news, products, reporting, requests, taxonomy
 from app.seed import ensure_default_drop_taxonomy
 
 settings = get_settings()
@@ -36,6 +36,7 @@ app.include_router(admin_news.router, prefix=settings.api_prefix)
 app.include_router(catalogs.router, prefix=settings.api_prefix)
 app.include_router(analytics.router, prefix=settings.api_prefix)
 app.include_router(reporting.router, prefix=settings.api_prefix)
+app.include_router(requests.router, prefix=settings.api_prefix)
 app.include_router(audit.router, prefix=settings.api_prefix)
 app.include_router(assets.router, prefix=settings.api_prefix)
 
