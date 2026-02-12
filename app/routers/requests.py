@@ -1,15 +1,25 @@
-from collections import defaultdict
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.audit import log_audit, serialize_instance
+from app.client_ip import build_trusted_proxy_networks, extract_client_ip
 from app.config import get_settings
 from app.database import get_db
 from app.dependencies import get_current_user, require_roles
-from app.models import AnalyticsEvent, EventType, Product, ProductRequest, ProductRequestItem, RequestStatus, User, UserRole
+from app.models import (
+    AnalyticsEvent,
+    EventType,
+    Product,
+    ProductRequest,
+    ProductRequestItem,
+    ProductRequestStatusHistory,
+    RequestStatus,
+    User,
+    UserRole,
+)
 from app.pagination import paginate_select
 from app.rate_limit import InMemoryRateLimiter
 from app.schemas import (
@@ -23,17 +33,43 @@ from app.schemas import (
 router = APIRouter(prefix='/requests', tags=['requests'])
 settings = get_settings()
 rate_limiter = InMemoryRateLimiter()
+trusted_proxy_networks = build_trusted_proxy_networks(settings.trusted_proxy_cidrs)
 
-resolved_statuses = {RequestStatus.fulfilled, RequestStatus.declined_customer, RequestStatus.declined_business}
+terminal_statuses = {RequestStatus.fulfilled, RequestStatus.declined_customer, RequestStatus.declined_business}
+valid_transitions = {
+    RequestStatus.submitted: {RequestStatus.paid},
+    RequestStatus.paid: terminal_statuses,
+    RequestStatus.fulfilled: set(),
+    RequestStatus.declined_customer: set(),
+    RequestStatus.declined_business: set(),
+}
+
+
+def _canonical_status(value: RequestStatus) -> RequestStatus:
+    if value in {RequestStatus.contacted, RequestStatus.in_progress}:
+        return RequestStatus.paid
+    return value
+
+
+def _storage_status(value: RequestStatus) -> RequestStatus:
+    if value in {RequestStatus.paid, RequestStatus.in_progress}:
+        # Keeps compatibility with existing DB check constraints.
+        return RequestStatus.contacted
+    return value
 
 
 def _request_to_read(item: ProductRequest) -> ProductRequestRead:
     return ProductRequestRead(
         id=item.id,
+        idempotency_key=item.idempotency_key,
         session_id=item.session_id,
         visitor_id=item.visitor_id,
-        status=item.status,
+        status=_canonical_status(item.status),
+        status_reason=item.status_reason,
+        status_updated_by_user_id=item.status_updated_by_user_id,
+        status_updated_at=item.status_updated_at,
         page=item.page,
+        page_path=item.page,
         source=item.source,
         customer_name=item.customer_name,
         customer_email=item.customer_email,
@@ -43,12 +79,23 @@ def _request_to_read(item: ProductRequest) -> ProductRequestRead:
         utm_medium=item.utm_medium,
         utm_campaign=item.utm_campaign,
         referrer=item.referrer,
+        total_amount_cents=item.total_amount_cents,
         created_at=item.created_at,
         updated_at=item.updated_at,
         contacted_at=item.contacted_at,
+        paid_at=item.paid_at,
+        delivered_at=item.delivered_at,
         resolved_at=item.resolved_at,
         items=[
-            ProductRequestItemRead(product_id=row.product_id, product_name=row.product_name, quantity=row.quantity)
+            ProductRequestItemRead(
+                product_id=row.product_id,
+                product_name=row.product_name,
+                qty=row.quantity,
+                variant_size=row.variant_size,
+                variant_color=row.variant_color,
+                unit_price_cents=row.unit_price_cents,
+                quantity=row.quantity,
+            )
             for row in sorted(item.items, key=lambda v: (v.created_at, v.id))
         ],
     )
@@ -65,22 +112,57 @@ def _validate_origin(request: Request) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='Origin no permitido')
 
 
-def _validate_key(x_events_key: str | None) -> None:
-    if settings.public_event_write_key and x_events_key != settings.public_event_write_key:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Clave de tracking invalida')
+def _parse_write_keys() -> dict[str, str]:
+    keys: dict[str, str] = {}
+    if settings.public_event_write_key:
+        keys['legacy'] = settings.public_event_write_key
+    for idx, item in enumerate(settings.public_event_write_keys, start=1):
+        raw = item.strip()
+        if not raw:
+            continue
+        if ':' in raw:
+            key_id, key_val = raw.split(':', 1)
+        else:
+            key_id, key_val = f'key-{idx}', raw
+        key_id = key_id.strip()
+        key_val = key_val.strip()
+        if key_id and key_val:
+            keys[key_id] = key_val
+    return keys
+
+
+def _validate_key(x_events_key: str | None) -> str | None:
+    valid_keys = _parse_write_keys()
+    if not valid_keys:
+        if settings.public_event_require_key:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Clave de tracking requerida')
+        return None
+    if not x_events_key:
+        if settings.public_event_require_key:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Clave de tracking requerida')
+        return None
+    for key_id, key_val in valid_keys.items():
+        if x_events_key == key_val:
+            return key_id
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Clave de tracking invalida')
 
 
 @router.post('/public', response_model=ProductRequestRead, status_code=201)
 def create_public_request(
     payload: ProductRequestCreate,
     request: Request,
+    response: Response,
     db: Session = Depends(get_db),
     x_events_key: str | None = Header(default=None, alias='X-Events-Key'),
 ) -> ProductRequestRead:
-    _validate_key(x_events_key)
+    key_id = _validate_key(x_events_key)
     _validate_origin(request)
 
-    client_ip = request.client.host if request.client else 'unknown'
+    client_ip = extract_client_ip(
+        request,
+        trusted_proxy_networks=trusted_proxy_networks,
+        trust_proxy_headers=settings.trust_proxy_headers,
+    )
     key = f'{client_ip}:{payload.session_id}:{payload.visitor_id or "na"}'
     allowed, retry_after = rate_limiter.allow(
         key,
@@ -94,22 +176,48 @@ def create_public_request(
             headers={'Retry-After': str(retry_after)},
         )
 
-    requested_qty: dict[str, int] = defaultdict(int)
-    for row in payload.items:
-        requested_qty[row.product_id] += row.quantity
+    existing = db.execute(
+        select(ProductRequest).options(selectinload(ProductRequest.items)).where(
+            ProductRequest.idempotency_key == payload.idempotency_key
+        )
+    ).scalar_one_or_none()
+    if existing:
+        response.status_code = status.HTTP_200_OK
+        return _request_to_read(existing)
 
-    product_rows = db.execute(select(Product).where(Product.id.in_(requested_qty.keys()))).scalars().all()
+    merged_items: dict[str, dict] = {}
+    for row in payload.items:
+        item = merged_items.get(row.product_id)
+        if item is None:
+            merged_items[row.product_id] = {
+                'qty': row.qty,
+                'variant_size': row.variant_size,
+                'variant_color': row.variant_color,
+                'unit_price_cents': row.unit_price_cents,
+            }
+            continue
+
+        item['qty'] += row.qty
+        if item['variant_size'] != row.variant_size:
+            item['variant_size'] = None
+        if item['variant_color'] != row.variant_color:
+            item['variant_color'] = None
+        if item['unit_price_cents'] != row.unit_price_cents:
+            item['unit_price_cents'] = None
+
+    product_rows = db.execute(select(Product).where(Product.id.in_(merged_items.keys()))).scalars().all()
     product_by_id = {row.id: row for row in product_rows}
-    missing_ids = [product_id for product_id in requested_qty if product_id not in product_by_id]
+    missing_ids = [product_id for product_id in merged_items if product_id not in product_by_id]
     if missing_ids:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f'Productos no encontrados: {", ".join(missing_ids)}')
 
     request_row = ProductRequest(
+        idempotency_key=payload.idempotency_key,
         session_id=payload.session_id,
         visitor_id=payload.visitor_id,
         status=RequestStatus.submitted,
-        page=payload.page,
-        source=payload.source,
+        page=payload.page_path,
+        source=payload.source.value,
         customer_name=payload.customer_name,
         customer_email=payload.customer_email,
         customer_phone=payload.customer_phone,
@@ -122,29 +230,46 @@ def create_public_request(
     db.add(request_row)
     db.flush()
 
-    for product_id, quantity in requested_qty.items():
+    total_amount_cents = 0
+    total_has_unknown_price = False
+    for product_id, item in merged_items.items():
+        resolved_unit_price_cents = item['unit_price_cents']
+        if resolved_unit_price_cents is None:
+            resolved_unit_price_cents = product_by_id[product_id].price_cents
+        if resolved_unit_price_cents is None:
+            total_has_unknown_price = True
+        else:
+            total_amount_cents += resolved_unit_price_cents * item['qty']
         db.add(
             ProductRequestItem(
                 request_id=request_row.id,
                 product_id=product_id,
                 product_name=product_by_id[product_id].name,
-                quantity=quantity,
+                quantity=item['qty'],
+                variant_size=item['variant_size'],
+                variant_color=item['variant_color'],
+                unit_price_cents=resolved_unit_price_cents,
             )
         )
+    request_row.total_amount_cents = None if total_has_unknown_price else total_amount_cents
 
+    now = datetime.now(timezone.utc)
     db.add(
         AnalyticsEvent(
             event_type=EventType.request_submitted,
             request_id=request_row.id,
-            page=payload.page,
-            source=payload.source,
+            page=payload.page_path,
+            source=payload.source.value,
             session_id=payload.session_id,
             visitor_id=payload.visitor_id,
+            idempotency_key=f'request:{payload.idempotency_key}',
+            key_id=key_id,
             utm_source=payload.utm_source,
             utm_medium=payload.utm_medium,
             utm_campaign=payload.utm_campaign,
             referrer=payload.referrer,
-            occurred_at=datetime.now(timezone.utc),
+            occurred_at=now,
+            received_at=now,
         )
     )
 
@@ -164,18 +289,27 @@ def list_requests(
     end_at: datetime | None = Query(default=None),
     session_id: str | None = Query(default=None, min_length=8, max_length=120),
     product_id: str | None = Query(default=None, min_length=36, max_length=36),
+    source: str | None = Query(default=None, min_length=1, max_length=255),
     db: Session = Depends(get_db),
 ) -> ProductRequestListResponse:
     statement = select(ProductRequest).options(selectinload(ProductRequest.items))
 
     if status_filter:
-        statement = statement.where(ProductRequest.status == status_filter)
+        normalized_status = _canonical_status(status_filter)
+        if normalized_status == RequestStatus.paid:
+            statement = statement.where(
+                ProductRequest.status.in_([RequestStatus.paid, RequestStatus.in_progress, RequestStatus.contacted])
+            )
+        else:
+            statement = statement.where(ProductRequest.status == normalized_status)
     if start_at:
         statement = statement.where(ProductRequest.created_at >= start_at)
     if end_at:
         statement = statement.where(ProductRequest.created_at <= end_at)
     if session_id:
         statement = statement.where(ProductRequest.session_id == session_id)
+    if source:
+        statement = statement.where(ProductRequest.source == source.strip().lower())
     if product_id:
         statement = statement.where(
             ProductRequest.id.in_(
@@ -215,23 +349,71 @@ def update_request_status(
     if not request_row:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Request no encontrado')
 
-    before = serialize_instance(request_row)
+    current_status = _canonical_status(request_row.status)
+    target_status = _canonical_status(payload.status)
+    storage_target_status = _storage_status(target_status)
     now = datetime.now(timezone.utc)
-    request_row.status = payload.status
+
+    if target_status == RequestStatus.submitted and current_status != RequestStatus.submitted:
+        if not settings.request_allow_reopen_to_submitted:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail='Revertir a submitted no esta habilitado en este entorno',
+            )
+        if not payload.reason:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='reason obligatorio para reabrir')
+    elif target_status != current_status and target_status not in valid_transitions.get(current_status, set()):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f'Transicion invalida: {current_status.value} -> {target_status.value}',
+        )
+
+    before = serialize_instance(request_row)
+    previous_status = request_row.status
+    request_row.status = storage_target_status
     if payload.notes is not None:
         request_row.notes = payload.notes
+    request_row.status_reason = payload.reason
+    request_row.status_updated_by_user_id = actor.id
+    request_row.status_updated_at = now
 
-    if payload.status == RequestStatus.submitted:
+    if target_status == RequestStatus.submitted:
         request_row.contacted_at = None
+        request_row.paid_at = None
+        request_row.delivered_at = None
         request_row.resolved_at = None
-    elif payload.status == RequestStatus.contacted:
+    elif target_status == RequestStatus.paid:
         if request_row.contacted_at is None:
             request_row.contacted_at = now
+        if request_row.paid_at is None:
+            request_row.paid_at = now
+        request_row.delivered_at = None
         request_row.resolved_at = None
-    elif payload.status in resolved_statuses:
+    elif target_status == RequestStatus.fulfilled:
         if request_row.contacted_at is None:
             request_row.contacted_at = now
+        if request_row.paid_at is None:
+            request_row.paid_at = now
+        request_row.delivered_at = now
         request_row.resolved_at = now
+    elif target_status in terminal_statuses:
+        if request_row.contacted_at is None:
+            request_row.contacted_at = now
+        request_row.delivered_at = None
+        request_row.resolved_at = now
+
+    if storage_target_status != previous_status:
+        db.add(
+            ProductRequestStatusHistory(
+                request_id=request_row.id,
+                previous_status=previous_status,
+                new_status=storage_target_status,
+                reason=payload.reason,
+                changed_by_user_id=actor.id,
+                changed_by_username=actor.username,
+                changed_at=now,
+            )
+        )
 
     db.flush()
     log_audit(db, actor, 'product_request', request_row.id, 'update_status', before, serialize_instance(request_row))

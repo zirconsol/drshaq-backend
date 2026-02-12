@@ -43,8 +43,23 @@ class EventType(str, Enum):
     request_submitted = 'request_submitted'
 
 
+class EventSource(str, Enum):
+    hero_cta = 'hero_cta'
+    product_card = 'product_card'
+    product_detail = 'product_detail'
+    category_grid = 'category_grid'
+    catalog_grid = 'catalog_grid'
+    floating_whatsapp = 'floating_whatsapp'
+    nav_cta = 'nav_cta'
+    dashboard = 'dashboard'
+    unknown = 'unknown'
+
+
 class RequestStatus(str, Enum):
     submitted = 'submitted'
+    paid = 'paid'
+    in_progress = 'in_progress'
+    # Backward-compatible alias from old schema.
     contacted = 'contacted'
     fulfilled = 'fulfilled'
     declined_customer = 'declined_customer'
@@ -116,6 +131,8 @@ class Product(Base):
     name: Mapped[str] = mapped_column(String(180), index=True)
     slug: Mapped[str] = mapped_column(String(180), unique=True, index=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    price_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
     primary_image_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     status: Mapped[ContentStatus] = mapped_column(SqlEnum(ContentStatus), default=ContentStatus.draft, index=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, index=True)
@@ -223,6 +240,7 @@ class ProductRequest(Base):
     __tablename__ = 'product_requests'
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True, unique=True, index=True)
     session_id: Mapped[str] = mapped_column(String(120), index=True)
     visitor_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
     status: Mapped[RequestStatus] = mapped_column(SqlEnum(RequestStatus), default=RequestStatus.submitted, index=True)
@@ -236,13 +254,27 @@ class ProductRequest(Base):
     utm_medium: Mapped[str | None] = mapped_column(String(120), nullable=True)
     utm_campaign: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
     referrer: Mapped[str | None] = mapped_column(String(512), nullable=True, index=True)
+    total_amount_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    status_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status_updated_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey('users.id', ondelete='SET NULL'),
+        nullable=True,
+        index=True,
+    )
+    status_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     contacted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
     items: Mapped[list[ProductRequestItem]] = relationship(back_populates='request', cascade='all, delete-orphan')
     events: Mapped[list[AnalyticsEvent]] = relationship(back_populates='request')
+    status_history: Mapped[list[ProductRequestStatusHistory]] = relationship(
+        back_populates='request',
+        cascade='all, delete-orphan',
+    )
 
 
 class ProductRequestItem(Base):
@@ -254,10 +286,32 @@ class ProductRequestItem(Base):
     product_id: Mapped[str | None] = mapped_column(ForeignKey('products.id', ondelete='SET NULL'), nullable=True, index=True)
     product_name: Mapped[str] = mapped_column(String(180))
     quantity: Mapped[int] = mapped_column(Integer, default=1)
+    variant_size: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    variant_color: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    unit_price_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     request: Mapped[ProductRequest] = relationship(back_populates='items')
     product: Mapped[Product | None] = relationship(back_populates='request_items')
+
+
+class ProductRequestStatusHistory(Base):
+    __tablename__ = 'product_request_status_history'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    request_id: Mapped[str] = mapped_column(ForeignKey('product_requests.id', ondelete='CASCADE'), index=True)
+    previous_status: Mapped[RequestStatus] = mapped_column(SqlEnum(RequestStatus), index=True)
+    new_status: Mapped[RequestStatus] = mapped_column(SqlEnum(RequestStatus), index=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    changed_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey('users.id', ondelete='SET NULL'),
+        nullable=True,
+        index=True,
+    )
+    changed_by_username: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+    request: Mapped[ProductRequest] = relationship(back_populates='status_history')
 
 
 class AnalyticsEvent(Base):
@@ -271,6 +325,8 @@ class AnalyticsEvent(Base):
     source: Mapped[str] = mapped_column(String(255), index=True)
     session_id: Mapped[str] = mapped_column(String(120), index=True)
     visitor_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True, unique=True, index=True)
+    key_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
     request_id: Mapped[str | None] = mapped_column(
         ForeignKey('product_requests.id', ondelete='SET NULL'),
         nullable=True,
@@ -281,6 +337,7 @@ class AnalyticsEvent(Base):
     utm_campaign: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
     referrer: Mapped[str | None] = mapped_column(String(512), nullable=True, index=True)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     product: Mapped[Product | None] = relationship(back_populates='events')

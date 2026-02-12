@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import case, func, select
@@ -28,10 +29,29 @@ click_case = case((AnalyticsEvent.event_type == EventType.click, 1), else_=0)
 fulfilled_qty_case = case((ProductRequest.status == RequestStatus.fulfilled, ProductRequestItem.quantity), else_=0)
 
 
-def _resolve_dates(start_at: datetime | None, end_at: datetime | None) -> tuple[datetime, datetime]:
-    end = end_at or datetime.now(timezone.utc)
-    start = start_at or (end - timedelta(days=30))
-    return start, end
+def _resolve_dates(
+    start_at: datetime | None,
+    end_at: datetime | None,
+    *,
+    from_at: datetime | None = None,
+    to_at: datetime | None = None,
+    tz: str = 'UTC',
+) -> tuple[datetime, datetime]:
+    requested_tz = tz or 'UTC'
+    try:
+        zone = ZoneInfo(requested_tz)
+    except ZoneInfoNotFoundError:
+        zone = ZoneInfo('UTC')
+
+    end_local = end_at or to_at or datetime.now(zone)
+    start_local = start_at or from_at or (end_local - timedelta(days=30))
+
+    if start_local.tzinfo is None:
+        start_local = start_local.replace(tzinfo=zone)
+    if end_local.tzinfo is None:
+        end_local = end_local.replace(tzinfo=zone)
+
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
 
 def _ctr(clicks: int, impressions: int) -> float:
@@ -40,6 +60,13 @@ def _ctr(clicks: int, impressions: int) -> float:
 
 def _rate(part: int, total: int) -> float:
     return round((part / total) * 100, 2) if total > 0 else 0.0
+
+
+def _normalize_source(source: str | None) -> str | None:
+    if source is None:
+        return None
+    normalized = source.strip().lower()
+    return normalized or None
 
 
 @router.get('/kpis', response_model=KpiReportResponse, dependencies=[Depends(require_roles(UserRole.admin, UserRole.editor))])
@@ -207,12 +234,16 @@ def get_utm_referrer_performance(
 def get_funnel_kpis(
     start_at: datetime | None = Query(default=None),
     end_at: datetime | None = Query(default=None),
+    from_at: datetime | None = Query(default=None, alias='from'),
+    to_at: datetime | None = Query(default=None, alias='to'),
+    tz: str = Query(default='UTC', min_length=2, max_length=50),
     source: str | None = Query(default=None, min_length=1, max_length=255),
     db: Session = Depends(get_db),
 ) -> FunnelKpiResponse:
-    start, end = _resolve_dates(start_at, end_at)
+    start, end = _resolve_dates(start_at, end_at, from_at=from_at, to_at=to_at, tz=tz)
     identity_expr = func.coalesce(AnalyticsEvent.visitor_id, AnalyticsEvent.session_id)
     request_identity_expr = func.coalesce(ProductRequest.visitor_id, ProductRequest.session_id)
+    normalized_source = _normalize_source(source)
 
     cta_filters = [
         AnalyticsEvent.event_type == EventType.cta_click,
@@ -220,9 +251,9 @@ def get_funnel_kpis(
         AnalyticsEvent.occurred_at <= end,
     ]
     request_filters = [ProductRequest.created_at >= start, ProductRequest.created_at <= end]
-    if source:
-        cta_filters.append(AnalyticsEvent.source == source)
-        request_filters.append(ProductRequest.source == source)
+    if normalized_source:
+        cta_filters.append(AnalyticsEvent.source == normalized_source)
+        request_filters.append(ProductRequest.source == normalized_source)
 
     cta_identity_subquery = select(func.distinct(identity_expr).label('identity')).where(*cta_filters).subquery()
     cta_users = int(db.execute(select(func.count()).select_from(cta_identity_subquery)).scalar_one() or 0)
@@ -287,16 +318,20 @@ def get_funnel_kpis(
 def get_top_requested_products(
     start_at: datetime | None = Query(default=None),
     end_at: datetime | None = Query(default=None),
+    from_at: datetime | None = Query(default=None, alias='from'),
+    to_at: datetime | None = Query(default=None, alias='to'),
+    tz: str = Query(default='UTC', min_length=2, max_length=50),
     limit: int = Query(default=10, ge=1, le=100),
     source: str | None = Query(default=None, min_length=1, max_length=255),
     db: Session = Depends(get_db),
 ) -> TopRequestedProductsResponse:
-    start, end = _resolve_dates(start_at, end_at)
+    start, end = _resolve_dates(start_at, end_at, from_at=from_at, to_at=to_at, tz=tz)
     name_expr = func.coalesce(Product.name, ProductRequestItem.product_name).label('product_name')
+    normalized_source = _normalize_source(source)
 
     filters = [ProductRequest.created_at >= start, ProductRequest.created_at <= end]
-    if source:
-        filters.append(ProductRequest.source == source)
+    if normalized_source:
+        filters.append(ProductRequest.source == normalized_source)
 
     rows = db.execute(
         select(

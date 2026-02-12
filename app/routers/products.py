@@ -43,6 +43,8 @@ def _product_to_read(item: Product) -> ProductRead:
         name=item.name,
         slug=item.slug,
         description=item.description,
+        price_cents=item.price_cents,
+        currency=item.currency,
         primary_image_path=item.primary_image_path,
         primary_image_url=build_public_asset_url(item.primary_image_path),
         status=item.status,
@@ -80,6 +82,14 @@ def _validate_product_relations(db: Session, category_id: int | None, collection
             )
 
 
+def _validate_price_fields(price_cents: int | None, currency: str | None) -> None:
+    if (price_cents is None) != (currency is None):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='price_cents y currency deben enviarse juntos o ambos en null',
+        )
+
+
 def _delete_product_asset(path: str) -> None:
     if settings.asset_provider != 'supabase':
         return
@@ -107,6 +117,7 @@ def create_product(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='Slug de producto ya existe')
 
     _validate_product_relations(db, payload.category_id, payload.collection_id)
+    _validate_price_fields(payload.price_cents, payload.currency)
 
     product_data = payload.model_dump()
     if product_data.get('primary_image_path'):
@@ -185,7 +196,10 @@ def update_product(
 
     effective_category_id = data['category_id'] if 'category_id' in data else product.category_id
     effective_collection_id = data['collection_id'] if 'collection_id' in data else product.collection_id
+    effective_price_cents = data['price_cents'] if 'price_cents' in data else product.price_cents
+    effective_currency = data['currency'] if 'currency' in data else product.currency
     _validate_product_relations(db, effective_category_id, effective_collection_id)
+    _validate_price_fields(effective_price_cents, effective_currency)
 
     for field, value in data.items():
         if field == 'primary_image_path' and value is not None:

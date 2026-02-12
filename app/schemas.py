@@ -4,9 +4,12 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.models import ContentStatus, EventType, RequestStatus, UserRole
+from app.models import ContentStatus, EventSource, EventType, RequestStatus, UserRole
 
 SLUG_PATTERN = r'^[a-z0-9]+(?:-[a-z0-9]+)*$'
+TRACKING_ID_PATTERN = r'^[A-Za-z0-9][A-Za-z0-9._:-]{7,119}$'
+IDEMPOTENCY_KEY_PATTERN = r'^[A-Za-z0-9][A-Za-z0-9._:-]{7,119}$'
+PAGE_PATH_PATTERN = r'^/[^\s]{0,254}$'
 
 
 class StrictSchema(BaseModel):
@@ -88,22 +91,40 @@ class ProductCreate(StrictSchema):
     name: str = Field(min_length=2, max_length=180)
     slug: str = Field(min_length=2, max_length=180, pattern=SLUG_PATTERN)
     description: str | None = Field(default=None, max_length=4000)
+    price_cents: int | None = Field(default=None, ge=0)
+    currency: str | None = Field(default=None, min_length=3, max_length=3)
     primary_image_path: str | None = Field(default=None, min_length=3, max_length=1024)
     status: ContentStatus = ContentStatus.draft
     sort_order: int = Field(default=0, ge=0)
     category_id: int | None = Field(default=None, ge=1)
     collection_id: int | None = Field(default=None, ge=1)
 
+    @field_validator('currency')
+    @classmethod
+    def normalize_currency(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip().upper()
+
 
 class ProductUpdate(StrictSchema):
     name: str | None = Field(default=None, min_length=2, max_length=180)
     slug: str | None = Field(default=None, min_length=2, max_length=180, pattern=SLUG_PATTERN)
     description: str | None = Field(default=None, max_length=4000)
+    price_cents: int | None = Field(default=None, ge=0)
+    currency: str | None = Field(default=None, min_length=3, max_length=3)
     primary_image_path: str | None = Field(default=None, min_length=3, max_length=1024)
     status: ContentStatus | None = None
     sort_order: int | None = Field(default=None, ge=0)
     category_id: int | None = Field(default=None, ge=1)
     collection_id: int | None = Field(default=None, ge=1)
+
+    @field_validator('currency')
+    @classmethod
+    def normalize_currency(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip().upper()
 
 
 class ProductOrderUpdate(StrictSchema):
@@ -115,6 +136,8 @@ class ProductRead(StrictSchema):
     name: str
     slug: str
     description: str | None
+    price_cents: int | None
+    currency: str | None
     primary_image_path: str | None
     primary_image_url: str | None
     status: ContentStatus
@@ -278,20 +301,89 @@ class CategoryProductTypeListResponse(StrictSchema):
     meta: PaginationMeta
 
 
+class PublicTaxonomyRead(StrictSchema):
+    id: int
+    name: str
+    slug: str
+
+
+class PublicTaxonomyListResponse(StrictSchema):
+    version: str = 'v1'
+    items: list[PublicTaxonomyRead]
+    meta: PaginationMeta
+
+
+class PublicProductImageRead(StrictSchema):
+    id: int
+    public_url: str | None
+    alt_text: str | None
+    sort_order: int
+
+
+class PublicProductCategoryRef(StrictSchema):
+    id: int
+    name: str
+    slug: str
+
+
+class PublicProductCollectionRef(StrictSchema):
+    id: int
+    name: str
+    slug: str
+
+
+class PublicProductRead(StrictSchema):
+    id: str
+    name: str
+    slug: str
+    description: str | None
+    status: str = 'active'
+    price_cents: int | None = None
+    currency: str | None = None
+    visible_variants: list[str] = Field(default_factory=list)
+    primary_image_url: str | None
+    category: PublicProductCategoryRef | None
+    collection: PublicProductCollectionRef | None
+    images: list[PublicProductImageRead] = Field(default_factory=list)
+
+
+class PublicProductListResponse(StrictSchema):
+    version: str = 'v1'
+    items: list[PublicProductRead]
+    meta: PaginationMeta
+
+
+class PublicCatalogResponse(StrictSchema):
+    version: str = 'v1'
+    drop_slug: str | None
+    cat: str | None
+    items: list[PublicProductRead]
+    meta: PaginationMeta
+
+
 class AnalyticsEventCreate(StrictSchema):
     event_type: EventType
     product_id: str | None = Field(default=None, min_length=36, max_length=36)
     catalog_id: str | None = Field(default=None, min_length=36, max_length=36)
     request_id: str | None = Field(default=None, min_length=36, max_length=36)
-    page: str = Field(min_length=1, max_length=255)
-    source: str = Field(min_length=1, max_length=255)
-    session_id: str = Field(min_length=8, max_length=120)
-    visitor_id: str | None = Field(default=None, min_length=8, max_length=120)
+    page: str = Field(min_length=1, max_length=255, pattern=PAGE_PATH_PATTERN)
+    source: EventSource
+    session_id: str = Field(min_length=8, max_length=120, pattern=TRACKING_ID_PATTERN)
+    visitor_id: str | None = Field(default=None, min_length=8, max_length=120, pattern=TRACKING_ID_PATTERN)
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=120, pattern=IDEMPOTENCY_KEY_PATTERN)
+    key_id: str | None = Field(default=None, min_length=2, max_length=80)
     occurred_at: datetime | None = None
     utm_source: str | None = Field(default=None, max_length=120)
     utm_medium: str | None = Field(default=None, max_length=120)
     utm_campaign: str | None = Field(default=None, max_length=120)
     referrer: str | None = Field(default=None, max_length=512)
+
+    @field_validator('source', mode='before')
+    @classmethod
+    def normalize_source(cls, value: EventSource | str) -> EventSource | str:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
 
     @model_validator(mode='after')
     def validate_target(self) -> 'AnalyticsEventCreate':
@@ -303,29 +395,88 @@ class AnalyticsEventCreate(StrictSchema):
         return self
 
 
+class AnalyticsPublicEventCreate(StrictSchema):
+    event_name: EventType
+    source: EventSource
+    visitor_id: str = Field(min_length=8, max_length=120, pattern=TRACKING_ID_PATTERN)
+    session_id: str = Field(min_length=8, max_length=120, pattern=TRACKING_ID_PATTERN)
+    page_path: str = Field(min_length=1, max_length=255, pattern=PAGE_PATH_PATTERN)
+    idempotency_key: str = Field(min_length=8, max_length=120, pattern=IDEMPOTENCY_KEY_PATTERN)
+    occurred_at: datetime | None = None
+    product_id: str | None = Field(default=None, min_length=36, max_length=36)
+    catalog_id: str | None = Field(default=None, min_length=36, max_length=36)
+    request_id: str | None = Field(default=None, min_length=36, max_length=36)
+    utm_source: str | None = Field(default=None, max_length=120)
+    utm_medium: str | None = Field(default=None, max_length=120)
+    utm_campaign: str | None = Field(default=None, max_length=120)
+    referrer: str | None = Field(default=None, max_length=512)
+
+    @field_validator('source', mode='before')
+    @classmethod
+    def normalize_source(cls, value: EventSource | str) -> EventSource | str:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+    @model_validator(mode='after')
+    def validate_target(self) -> 'AnalyticsPublicEventCreate':
+        if self.event_name == EventType.request_submitted and not self.request_id:
+            raise ValueError('request_submitted requiere request_id')
+        if self.event_name == EventType.add_to_request and not self.product_id:
+            raise ValueError('add_to_request requiere product_id')
+        if self.event_name in {EventType.impression, EventType.click} and not self.product_id and not self.catalog_id:
+            raise ValueError('impression/click requiere product_id o catalog_id')
+        return self
+
+
 class AnalyticsEventRead(StrictSchema):
     id: int
+    event_name: EventType
     event_type: EventType
     product_id: str | None
     catalog_id: str | None
     request_id: str | None
+    idempotency_key: str | None
+    key_id: str | None
     page: str
+    page_path: str
     source: str
     session_id: str
     visitor_id: str | None
     occurred_at: datetime
+    received_at: datetime
+
+
+class AnalyticsIngestionMetricsRead(StrictSchema):
+    total: int
+    ingested: int
+    duplicated: int
+    rate_limited: int
+    unauthorized: int
 
 
 class ProductRequestItemCreate(StrictSchema):
     product_id: str = Field(min_length=36, max_length=36)
-    quantity: int = Field(default=1, ge=1, le=200)
+    qty: int = Field(default=1, ge=1, le=200)
+    variant_size: str | None = Field(default=None, max_length=40)
+    variant_color: str | None = Field(default=None, max_length=60)
+    unit_price_cents: int | None = Field(default=None, ge=0)
+
+    @field_validator('variant_size', 'variant_color')
+    @classmethod
+    def normalize_variants(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        trimmed = value.strip()
+        return trimmed or None
 
 
 class ProductRequestCreate(StrictSchema):
-    session_id: str = Field(min_length=8, max_length=120)
-    visitor_id: str | None = Field(default=None, min_length=8, max_length=120)
-    page: str = Field(min_length=1, max_length=255)
-    source: str = Field(min_length=1, max_length=255)
+    idempotency_key: str = Field(min_length=8, max_length=120, pattern=IDEMPOTENCY_KEY_PATTERN)
+    session_id: str = Field(min_length=8, max_length=120, pattern=TRACKING_ID_PATTERN)
+    visitor_id: str | None = Field(default=None, min_length=8, max_length=120, pattern=TRACKING_ID_PATTERN)
+    page_path: str = Field(min_length=1, max_length=255, pattern=PAGE_PATH_PATTERN)
+    source: EventSource
     customer_name: str | None = Field(default=None, min_length=2, max_length=160)
     customer_email: str | None = Field(default=None, max_length=160)
     customer_phone: str | None = Field(default=None, max_length=60)
@@ -336,19 +487,35 @@ class ProductRequestCreate(StrictSchema):
     referrer: str | None = Field(default=None, max_length=512)
     items: list[ProductRequestItemCreate] = Field(min_length=1, max_length=50)
 
+    @field_validator('source', mode='before')
+    @classmethod
+    def normalize_source(cls, value: EventSource | str) -> EventSource | str:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
 
 class ProductRequestItemRead(StrictSchema):
     product_id: str | None
     product_name: str
+    qty: int
+    variant_size: str | None
+    variant_color: str | None
+    unit_price_cents: int | None
     quantity: int
 
 
 class ProductRequestRead(StrictSchema):
     id: str
+    idempotency_key: str | None
     session_id: str
     visitor_id: str | None
     status: RequestStatus
+    status_reason: str | None
+    status_updated_by_user_id: str | None
+    status_updated_at: datetime | None
     page: str | None
+    page_path: str | None
     source: str | None
     customer_name: str | None
     customer_email: str | None
@@ -358,9 +525,12 @@ class ProductRequestRead(StrictSchema):
     utm_medium: str | None
     utm_campaign: str | None
     referrer: str | None
+    total_amount_cents: int | None
     created_at: datetime
     updated_at: datetime
     contacted_at: datetime | None
+    paid_at: datetime | None
+    delivered_at: datetime | None
     resolved_at: datetime | None
     items: list[ProductRequestItemRead] = Field(default_factory=list)
 
@@ -373,6 +543,13 @@ class ProductRequestListResponse(StrictSchema):
 class ProductRequestStatusUpdate(StrictSchema):
     status: RequestStatus
     notes: str | None = Field(default=None, max_length=4000)
+    reason: str | None = Field(default=None, max_length=4000)
+
+    @model_validator(mode='after')
+    def validate_reason(self) -> 'ProductRequestStatusUpdate':
+        if self.status in {RequestStatus.declined_customer, RequestStatus.declined_business} and not self.reason:
+            raise ValueError('reason es obligatorio para estados declined_*')
+        return self
 
 
 class KpiSummary(StrictSchema):
@@ -427,6 +604,7 @@ class UTMReferrerResponse(StrictSchema):
 
 
 class FunnelKpiResponse(StrictSchema):
+    version: str = 'v1'
     start_at: datetime
     end_at: datetime
     cta_users: int
@@ -450,6 +628,7 @@ class TopRequestedProductKpi(StrictSchema):
 
 
 class TopRequestedProductsResponse(StrictSchema):
+    version: str = 'v1'
     start_at: datetime
     end_at: datetime
     items: list[TopRequestedProductKpi]

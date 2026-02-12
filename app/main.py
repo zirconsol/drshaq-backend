@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.auth import ensure_seed_users
 from app.config import get_settings
 from app.database import SessionLocal, init_db
-from app.routers import admin_news, admin_products, analytics, assets, audit, auth, catalogs, news, products, reporting, requests, taxonomy
+from app.routers import admin_news, admin_products, analytics, assets, audit, auth, catalogs, news, products, public, reporting, requests, taxonomy
 from app.seed import ensure_default_drop_taxonomy
 
 settings = get_settings()
@@ -24,7 +24,15 @@ app.add_middleware(
     allow_origins=settings.cors_allowed_origins,
     allow_credentials=False,
     allow_methods=['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-    allow_headers=['Authorization', 'Content-Type'],
+    allow_headers=[
+        'Authorization',
+        'Content-Type',
+        'If-None-Match',
+        'If-Modified-Since',
+        'X-Events-Key',
+        'X-Public-Read-Key',
+        'X-Request-Id',
+    ],
 )
 
 app.include_router(auth.router, prefix=settings.api_prefix)
@@ -34,6 +42,7 @@ app.include_router(admin_products.router, prefix=settings.api_prefix)
 app.include_router(news.router, prefix=settings.api_prefix)
 app.include_router(admin_news.router, prefix=settings.api_prefix)
 app.include_router(catalogs.router, prefix=settings.api_prefix)
+app.include_router(public.router, prefix=settings.api_prefix)
 app.include_router(analytics.router, prefix=settings.api_prefix)
 app.include_router(reporting.router, prefix=settings.api_prefix)
 app.include_router(requests.router, prefix=settings.api_prefix)

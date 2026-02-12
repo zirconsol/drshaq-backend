@@ -29,7 +29,18 @@ class Settings(BaseSettings):
     public_event_rate_limit_window_seconds: int = Field(default=60, ge=1, le=3600)
     public_event_rate_limit_requests: int = Field(default=300, ge=1, le=10000)
     public_event_write_key: str | None = None
+    public_event_write_keys: Annotated[List[str], NoDecode] = Field(default_factory=list)
+    public_event_require_key: bool = False
+    public_read_rate_limit_window_seconds: int = Field(default=60, ge=1, le=3600)
+    public_read_rate_limit_requests: int = Field(default=600, ge=1, le=20000)
+    public_read_key: str | None = None
+    public_read_keys: Annotated[List[str], NoDecode] = Field(default_factory=list)
+    public_read_require_key: bool = False
     public_tracking_allowed_origins: Annotated[List[str], NoDecode] = Field(default_factory=list)
+    trust_proxy_headers: bool = False
+    trusted_proxy_cidrs: Annotated[List[str], NoDecode] = Field(default_factory=list)
+    request_allow_reopen_to_submitted: bool = False
+    tracking_retention_days: int = Field(default=180, ge=7, le=3650)
 
     admin_seed_username: str = 'admin'
     admin_seed_password: str = Field(default='admin12345', min_length=8)
@@ -64,6 +75,21 @@ class Settings(BaseSettings):
     @field_validator('public_tracking_allowed_origins', mode='before')
     @classmethod
     def split_public_tracking_origins(cls, value: str | List[str]) -> List[str]:
+        return cls.split_cors_origins(value)
+
+    @field_validator('public_event_write_keys', mode='before')
+    @classmethod
+    def split_public_event_write_keys(cls, value: str | List[str]) -> List[str]:
+        return cls.split_cors_origins(value)
+
+    @field_validator('public_read_keys', mode='before')
+    @classmethod
+    def split_public_read_keys(cls, value: str | List[str]) -> List[str]:
+        return cls.split_cors_origins(value)
+
+    @field_validator('trusted_proxy_cidrs', mode='before')
+    @classmethod
+    def split_trusted_proxy_cidrs(cls, value: str | List[str]) -> List[str]:
         return cls.split_cors_origins(value)
 
 
