@@ -49,6 +49,8 @@ def _product_to_read(item: Product) -> ProductRead:
         name=item.name,
         slug=item.slug,
         description=item.description,
+        price_cents=item.price_cents,
+        currency=item.currency,
         primary_image_path=item.primary_image_path,
         primary_image_url=build_public_asset_url(item.primary_image_path),
         status=item.status,
