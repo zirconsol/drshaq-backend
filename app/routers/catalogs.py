@@ -56,9 +56,6 @@ def create_catalog(
     db: Session = Depends(get_db),
     actor: User = Depends(get_current_user),
 ) -> CatalogRead:
-    if actor.role == UserRole.editor and payload.status != ContentStatus.draft:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='Editor solo puede crear borradores')
-
     existing = db.execute(select(Catalog).where(Catalog.slug == payload.slug)).scalar_one_or_none()
     if existing:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='Slug de catalogo ya existe')
@@ -128,9 +125,6 @@ def update_catalog(
     data = payload.model_dump(exclude_unset=True)
     if not data:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='No hay cambios para aplicar')
-
-    if 'status' in data and actor.role != UserRole.admin:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='Solo admin puede cambiar status')
 
     if 'slug' in data:
         existing = db.execute(select(Catalog).where(Catalog.slug == data['slug'], Catalog.id != catalog_id)).scalar_one_or_none()
